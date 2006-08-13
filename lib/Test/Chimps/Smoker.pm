@@ -27,7 +27,7 @@ them, and submit the report to a server.
     use Test::Chimps::Smoker;
 
     my $poller = Test::Chimps::Smoker->new(
-      server      => 'http://www.example.com/cgi-bin/smoke-server.pl',
+      server      => 'http://www.example.com/cgi-bin/chimps-server.pl',
       config_file => '/path/to/configfile.yml'
 
 
@@ -64,7 +64,7 @@ file.
 use base qw/Class::Accessor/;
 __PACKAGE__->mk_ro_accessors(qw/server config_file simulate/);
 __PACKAGE__->mk_accessors(
-  qw/_added_to_inc _env_stack _checkout_paths _config/);
+  qw/_added_to_inc _env_stack _checkout_paths _config projects iterations/);
 
 # add a signal handler so destructor gets run
 $SIG{INT} = sub {print "caught sigint.  cleaning up...\n"; exit(1)};
@@ -78,20 +78,31 @@ sub new {
 
 sub _init {
   my $self = shift;
-  my %args = validate_with(params => \@_,
-                           spec => 
-                           { server => 1,
-                             config_file => 1,
-                             simulate => 0},
-                           called => 'The Test::Chimps::Smoker constructor');
-  
+  my %args = validate_with(
+    params => \@_,
+    spec   => {
+      server      => 1,
+      config_file => 1,
+      simulate    => 0,
+      iterations  => {
+        optional => 1,
+        default  => 'inf'
+      },
+      projects => {
+        optional => 1,
+        default  => 'all'
+      }
+    },
+    called => 'The Test::Chimps::Smoker constructor'
+  );
+
   foreach my $key (keys %args) {
     $self->{$key} = $args{$key};
   }
   $self->_added_to_inc([]);
   $self->_env_stack([]);
   $self->_checkout_paths([]);
-  
+
   $self->_config(LoadFile($self->config_file));
 }
 
@@ -102,106 +113,201 @@ sub DESTROY {
   }
 }
 
-=head2 smoke
+sub _smoke_once {
+  my $self = shift;
+  my $project = shift;
+  my $config = $self->_config;
+
+  return 1 if $config->{$project}->{dependency_only};
+
+  my $info_out = `svn info $config->{$project}->{svn_uri}`;
+  $info_out =~ m/^Revision: (\d+)/m;
+  my $latest_revision = $1;
+  $info_out =~ m/^Last Changed Rev: (\d+)/m;
+  my $last_changed_revision = $1;
+
+  my $old_revision = $config->{$project}->{revision};
+
+  return 0 unless $last_changed_revision > $old_revision;
+
+  my @revisions = (($old_revision + 1) .. $latest_revision);
+  my $revision;
+  while (@revisions) {
+    $revision = shift @revisions;
+    # only actually do the check out if the revision and last changed revision match for
+    # a particular revision
+    last if _change_on_revision($config->{$project}->{svn_uri}, $revision);
+  }
+
+  $info_out = `svn info -r $revision $config->{$project}->{svn_uri}`;
+  $info_out =~ m/^Last Changed Author: (\w+)/m;
+  my $committer = $1;
+
+  $config->{$project}->{revision} = $revision;
+
+  $self->_checkout_project($config->{$project}, $revision);
+
+  my $model;
+  {
+    local $SIG{ALRM} = sub { die "10 minute timeout exceeded" };
+    alarm 600;
+    print "running tests for $project\n";
+    eval {
+      $model = Test::TAP::Model::Visual->new_with_tests(glob("t/*.t t/*/t/*.t"));
+    };
+    alarm 0;                    # cancel alarm
+  }
+
+  if ($@) {
+    print "Tests aborted: $@\n";
+  }
+
+  my $duration = $model->structure->{end_time} - $model->structure->{start_time};
+
+  $self->_unroll_env_stack;
+
+  foreach my $libdir (@{$self->_added_to_inc}) {
+    print "removing $libdir from \@INC\n";
+    shift @INC;
+  }
+  $self->_added_to_inc([]);
+
+  chdir(File::Spec->rootdir);
+
+  foreach my $tmpdir (@{$self->_checkout_paths}) {
+    _remove_tmpdir($tmpdir);
+  }
+  $self->_checkout_paths([]);
+
+  my $client = Test::Chimps::Client->new(
+    model            => $model,
+    report_variables => {
+      project   => $project,
+      revision  => $revision,
+      committer => $committer,
+      duration  => $duration,
+      osname    => $Config{osname},
+      osvers    => $Config{osvers},
+      archname  => $Config{archname}
+    },
+    server => $self->server
+  );
+
+  my ($status, $msg);
+  if ($self->simulate) {
+    $status = 1;
+  } else {
+    ($status, $msg) = $client->send;
+  }
+
+  if ($status) {
+    print "Sumbitted smoke report for $project revision $revision\n";
+    DumpFile($self->config_file, $config);
+    return 1;
+  } else {
+    print "Error: the server responded: $msg\n";
+    return 0;
+  }
+}
+
+sub _smoke_n_times {
+  my $self = shift;
+  my $n = shift;
+  my $projects = shift;
+
+  if ($n <= 0) {
+    die "Can not smoke projects a negative number of times";
+  } elsif ($n eq 'inf') {
+    while (1) {
+      $self->_smoke_projects($projects);
+      sleep 60;
+    }
+  } else {
+    for (my $i = 0; $i < $n;) {
+      $i++ if $self->_smoke_projects($projects);
+      sleep 60;
+    }
+  }
+}
+
+sub _smoke_projects {
+  my $self = shift;
+  my $projects = shift;
+  my $config = $self->_config;
+
+  foreach my $project (@$projects) {
+    $self->_smoke_once($project);
+  }
+}
+
+=head2 smoke PARAMS
 
 Calling smoke will cause the C<Smoker> object to continually poll
 repositories for changes in revision numbers.  If an (actual)
 change is detected, the repository will be checked out (with
 dependencies), built, and tested, and the resulting report will be
-submitted to the server.  This method does not return.
+submitted to the server.  This method may not return.  Valid
+options to smoke are:
+
+=over 4
+
+=item * iterations
+
+Specifies the number of iterations to run.  This is the number of
+smoke reports to generate per project.  A value of 'inf' means to
+continue smoking forever.  Defaults to 'inf'.
+
+=item * projects
+
+An array reference specifying which projects to smoke.  If the
+string 'all' is provided instead of an array reference, all
+projects will be smoked.  Defaults to 'all'.
+
+=back
 
 =cut
 
 sub smoke {
   my $self = shift;
   my $config = $self->_config;
-  while (1) {
-    foreach my $project (keys %{$config}) {
-      next if $config->{$project}->{dependency_only};
-    
-      my $info_out = `svn info $config->{$project}->{svn_uri}`;
-      $info_out =~ m/^Revision: (\d+)/m;
-      my $latest_revision = $1;
-      $info_out =~ m/^Last Changed Rev: (\d+)/m;
-      my $last_changed_revision = $1;
 
-      my $old_revision = $config->{$project}->{revision};
-
-      next unless $last_changed_revision > $old_revision;
-
-      foreach my $revision (($old_revision + 1) .. $latest_revision) {
-        # only actually do the check out if the revision and last changed revision match for
-        # a particular revision
-        next unless _change_on_revision($config->{$project}->{svn_uri}, $revision);
-
-        $info_out = `svn info -r $revision $config->{$project}->{svn_uri}`;
-        $info_out =~ m/^Last Changed Author: (\w+)/m;
-        my $committer = $1;
-        
-        $config->{$project}->{revision} = $revision;
-
-        $self->_checkout_project($config->{$project}, $revision);
-
-        my $model;
-        {
-          local $SIG{ALRM} = sub { die "10 minute timeout exceeded" };
-          alarm 600;
-          print "running tests for $project\n";
-          eval {
-            $model = Test::TAP::Model::Visual->new_with_tests(glob("t/*.t t/*/t/*.t"));
-          };
-          alarm 0; # cancel alarm
-        }
-        
-        if ($@) {
-          print "Tests aborted: $@\n";
-        }
-        
-        my $duration = $model->structure->{end_time} - $model->structure->{start_time};
-
-        $self->_unroll_env_stack;
-        
-        foreach my $libdir (@{$self->_added_to_inc}) {
-          print "removing $libdir from \@INC\n";
-          shift @INC;
-        }
-        $self->_added_to_inc([]);
-
-        chdir(File::Spec->rootdir);
-
-        foreach my $tmpdir (@{$self->_checkout_paths}) {
-          _remove_tmpdir($tmpdir);
-        }
-        $self->_checkout_paths([]);
-
-        my $client = Test::Chimps::Client->new(model => $model,
-                                               report_variables =>
-                                               { project => $project,
-                                                 revision => $revision,
-                                                 committer => $committer,
-                                                 duration => $duration,
-                                                 osname => $Config{osname},
-                                                 osvers => $Config{osvers},
-                                                 archname => $Config{archname}
-                                               },
-                                               server => $self->server);
-
-        my ($status, $msg);
-        if ($self->simulate) {
-          $status = 1;
-        } else {
-          ($status, $msg) = $client->send;
-        }
-        
-        if ($status) {
-          print "Sumbitted smoke report for $project revision $revision\n";
-          DumpFile($self->config_file, $config);
-        } else {
-          print "Error: the server responded: $msg\n";
-        }
+  my %args = validate_with(
+    params => \@_,
+    spec   => {
+      iterations => {
+        optional => 1,
+        type     => SCALAR,
+        regex    => qr/^(inf|\d+)$/,
+        default  => 'inf'
+      },
+      projects => {
+        optional => 1,
+        type     => ARRAYREF | SCALAR,
+        default  => 'all'
       }
-    }
-    sleep 60;
+    },
+    called => 'Test::Chimps::Smoker->smoke'
+  );
+
+  my $projects = $args{projects};
+  my $iterations = $args{iterations};
+  $self->_validate_projects_opt($projects);
+
+  if ($projects eq 'all') {
+    $projects = [keys %$config];
+  }
+
+  $self->_smoke_n_times($iterations, $projects);
+
+}
+
+sub _validate_projects_opt {
+  my ($self, $projects) = @_;
+  return if $projects eq 'all';
+
+  foreach my $project (@$projects) {
+    die "no such project: '$project'"
+      unless exists $self->_config->{$project};
   }
 }
 
@@ -225,7 +331,7 @@ sub _checkout_project {
       $self->_checkout_project($self->_config->{$dep}, 'HEAD');
     }
   }
-  
+
   chdir($projectdir);
 
   my $old_perl5lib = $ENV{PERL5LIB};
@@ -235,7 +341,7 @@ sub _checkout_project {
     system($project->{configure_cmd});
   }
   $ENV{PERL5LIB} = $old_perl5lib;
-  
+
   for my $libloc (qw{blib/lib}) {
     my $libdir = File::Spec->catdir($tmpdir,
                                     $project->{root_dir},
@@ -308,7 +414,7 @@ sub _unroll_env_stack {
 
 =head1 ACCESSORS
 
-There are read-only accessors for server, config_file, simulate.
+There are read-only accessors for server, config_file, and simulate.
 
 =head1 CONFIGURATION FILE
 
@@ -319,24 +425,24 @@ comprise the configuration options for that project.
 Perhaps an example is best.  A typical configuration file might
 look like this:
 
-    --- 
-    Some-jifty-project: 
+    ---
+    Some-jifty-project:
       configure_cmd: perl Makefile.PL --skipdeps && make
-      dependencies: 
+      dependencies:
         - Jifty
       revision: 555
       root_dir: trunk/foo
       svn_uri: svn+ssh://svn.example.com/svn/foo
-    Jifty: 
+    Jifty:
       configure_cmd: perl Makefile.PL --skipdeps && make
-      dependencies: 
+      dependencies:
         - Jifty-DBI
       revision: 1332
       root_dir: trunk
       svn_uri: svn+ssh://svn.jifty.org/svn/jifty.org/jifty
-    Jifty-DBI: 
+    Jifty-DBI:
       configure_cmd: perl Makefile.PL --skipdeps && make
-      env: 
+      env:
         JDBI_TEST_MYSQL: jiftydbitestdb
         JDBI_TEST_MYSQL_PASS: ''
         JDBI_TEST_MYSQL_USER: jiftydbitest
@@ -345,7 +451,7 @@ look like this:
       revision: 1358
       root_dir: trunk
       svn_uri: svn+ssh://svn.jifty.org/svn/jifty.org/Jifty-DBI
-    
+
 The supported project options are as follows:
 
 =over 4
@@ -395,6 +501,18 @@ present to serve as a dependency for another project.
 
 =back
 
+=head1 REPORT VARIABLES
+
+This module assumes the use of the following report variables:
+
+    project
+    revision
+    committer
+    duration
+    osname
+    osvers
+    archname
+
 =head1 AUTHOR
 
 Zev Benjamin, C<< <zev at cpan.org> >>
@@ -416,6 +534,13 @@ You can find documentation for this module with the perldoc command.
 You can also look for information at:
 
 =over 4
+
+=item * Mailing list
+
+Chimps has a mailman mailing list at
+L<chimps@bestpractical.com>.  You can subscribe via the web
+interface at
+L<http://lists.bestpractical.com/cgi-bin/mailman/listinfo/chimps>.
 
 =item * AnnoCPAN: Annotated CPAN documentation
 
