@@ -1,51 +1,74 @@
 package Test::Chimps::Client;
 
+use 5.008;
 use warnings;
 use strict;
 
+our $VERSION = '0.11_01';
+
 use Carp;
 use Params::Validate qw/:all/;
+use HTTP::Request::Common;
 use LWP::UserAgent;
-use Storable qw/nfreeze/;
 
-use constant PROTO_VERSION => 0.2;
+use constant PROTO_VERSION => 1.0;
 
 =head1 NAME
 
 Test::Chimps::Client - Send smoke test results to a server
-
-=head1 VERSION
-
-Version 0.05
-
-=cut
-
-our $VERSION = '0.05';
 
 =head1 SYNOPSIS
 
 This module simplifies the process of sending smoke test results
 (in the form of C<Test::TAP::Model>s) to a smoke server.
 
-    use Test::Chimps::Client;
-    use Test::TAP::Model::Visual;
+    use File::Temp;
+    my $tmpfile = File::Temp->new( SUFFIX => ".tar.gz" );
 
+    use TAP::Harness::Archive;
     chdir "some/module/directory";
+    my $harness = TAP::Harness::Archive->new( {
+        archive          => $tmpfile,
+        extra_properties => {
+            project   => 'my project',
+            revision  => 'some revision',
+            committer => 'me',
+            osname    => $Config{osname},
+            osvers    => $Config{osvers},
+            archname  => $Config{archname},
+        },
+        ....
+    } );
+    $harness->runtests(glob('t/*.t'));
 
-    my $model = Test::TAP::Model::Visual->new_with_tests(glob("t/*.t"));
-
+    use Test::Chimps::Client;
     my $client = Test::Chimps::Client->new(
-      server => 'http://www.example.com/cgi-bin/smoke-server.pl',
-      model  => $model
+        archive => $tmpfile,
+        server  => "http://...",
     );
-    
-    my ($status, $msg) = $client->send;
-    
-    if (! $status) {
-      print "Error: $msg\n";
-      exit(1);
-    }
 
+    print "Sending smoke report for $server\n";
+    my ($status, $msg) = $client->send;
+    die "Error: the server responded: $msg\n"
+        unless $status;
+
+=head1 INSTALLATION
+
+To install this module, run the following commands:
+
+    perl Makefile.PL
+    make
+    make test
+    make install
+
+=head1 DESCRIPTION
+
+Chimps is the Collaborative Heterogeneous Infinite Monkey
+Perfectionification Service.  It is a framework for storing,
+viewing, generating, and uploading smoke reports.
+
+This distribution provides client-side modules and binaries
+for Chimps.
 
 =head1 METHODS
 
@@ -55,11 +78,7 @@ Creates a new Client object.  ARGS is a hash whose valid keys are:
 
 =over 4
 
-=item * compress
-
-Optional.  Does not currently work
-
-=item * model
+=item * file
 
 Mandatory.  The value must be a C<Test::TAP::Model>.  These are the
 test results that will be submitted to the server.
@@ -79,7 +98,7 @@ Mandatory.  The URI of the server script to upload the model to.
 
 use base qw/Class::Accessor/;
 
-__PACKAGE__->mk_ro_accessors(qw/model server compress report_variables/);
+__PACKAGE__->mk_ro_accessors(qw/archive server/);
 
 sub new {
   my $class = shift;
@@ -94,9 +113,8 @@ sub _init {
     params => \@_,
     called => 'The Test::Chimps::Client constructor',
     spec   => {
-      model            => { isa => 'Test::TAP::Model' },
+      archive          => { isa => 'File::Temp' },
       server           => 1,
-      compress         => 0,
       report_variables => {
         optional => 1,
         type     => HASHREF,
@@ -120,32 +138,36 @@ and the second of which is an error string.
 =cut
 
 sub send {
-  my $self = shift;
-  
-  my $ua = LWP::UserAgent->new;
-  $ua->agent("Test-Chimps-Client/" . PROTO_VERSION);
-  $ua->env_proxy;
+    my $self = shift;
 
-  my %request = (upload => 1, version => PROTO_VERSION,
-                 model_structure => nfreeze($self->model->structure),
-                 report_variables => nfreeze($self->report_variables));
+    my $ua = LWP::UserAgent->new;
+    $ua->agent( "Test-Chimps-Client/" . PROTO_VERSION );
+    $ua->env_proxy;
 
-  my $resp = $ua->post($self->server => \%request);
-  if($resp->is_success) {
-    if($resp->content =~ /^ok/) {
-      return (1, '');
+    my $resp = $ua->post(
+        $self->server,
+        Content_Type => 'form-data',
+        Content      => [
+            upload  => 1,
+            archive => [ "$self->{archive}" ],
+            version => PROTO_VERSION
+        ],
+    );
+
+    if ( $resp->is_success ) {
+        if ( $resp->content =~ /^ok/ ) {
+            return ( 1, '' );
+        } else {
+            return ( 0, $resp->content );
+        }
     } else {
-      return (0, $resp->content);
+        return ( 0, $resp->status_line );
     }
-  } else {
-    return (0, $resp->status_line);
-  }
 }
 
 =head1 ACCESSORS
 
-There are read-only accessors for compress, model,
-report_variables, and server.
+There are read-only accessors for model, report_variables, and server.
 
 =head1 AUTHOR
 
@@ -176,6 +198,10 @@ L<chimps@bestpractical.com>.  You can subscribe via the web
 interface at
 L<http://lists.bestpractical.com/cgi-bin/mailman/listinfo/chimps>.
 
+=item * Repository
+
+L<http://github.com/bestpractical/test-chimps-client>
+
 =item * AnnoCPAN: Annotated CPAN documentation
 
 L<http://annocpan.org/dist/Test-Chimps-Client>
@@ -201,7 +227,7 @@ Pugs distribution.
 
 =head1 COPYRIGHT & LICENSE
 
-Copyright 2006 Best Practical Solutions.
+Copyright 2006-2009 Best Practical Solutions.
 Portions copyright 2005-2006 the Pugs project.
 
 This program is free software; you can redistribute it and/or modify it
